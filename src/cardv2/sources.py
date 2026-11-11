@@ -33,10 +33,14 @@ MODEL_NAME = "RealESRGAN_x4plus"
 MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
 MODEL_SHA256 = "4fa0d38905f75ac06eb49a7951b426670021be3018265fd191d2125df9d682f1"
 
+HSJSON_CATALOG = "https://api.hearthstonejson.com/v1/latest/{locale}/{name}.json"
+CATALOG_KINDS = ("collectible", "bg")
+
 IMAGE_MAX_BYTES = 32 * 1024 * 1024
+DATA_MAX_BYTES = 128 * 1024 * 1024
 VIDEO_MAX_BYTES = 128 * 1024 * 1024
 MODEL_MAX_BYTES = 256 * 1024 * 1024
-USER_AGENT = "cardv2/0.1"
+USER_AGENT = "cardv2/0.2"
 
 
 def cache_dir() -> Path:
@@ -168,3 +172,38 @@ def model_path() -> Path:
         path.unlink()
         raise CardError("bad_model", "downloaded model weights failed the checksum and were removed")
     return path
+
+
+def card_ids(kind: str = "collectible", locale: str = "enUS", with_golden: bool = False, refresh: bool = False) -> list[str]:
+    """Lines for `cardv2 batch --ids-file`, taken from the HearthstoneJSON catalogue.
+
+    collectible: every collectible card. bg: the Battlegrounds pool (minions and tavern spells),
+    written as "ID,normal,bg"; with_golden adds each minion's golden counterpart.
+    """
+    import json
+
+    if kind not in CATALOG_KINDS:
+        raise CardError("bad_kind", f"kind must be one of {CATALOG_KINDS}")
+    check_locale(locale)
+    url = HSJSON_CATALOG.format(locale=locale, name="cards.collectible" if kind == "collectible" else "cards")
+    if refresh:
+        stale = cache_dir() / "data" / f"{hashlib.sha256(url.encode()).hexdigest()[:16]}-{Path(url).name}"
+        stale.unlink(missing_ok=True)
+    try:
+        cards = json.loads(fetch(url, kind="data", max_bytes=DATA_MAX_BYTES, timeout=120).read_text(encoding="utf-8"))
+    except (ValueError, OSError) as error:
+        raise CardError("bad_catalog", f"cannot read the card catalogue: {error}") from error
+    if kind == "collectible":
+        return sorted(card["id"] for card in cards if CARD_ID.match(card.get("id", "")))
+    by_dbf = {card.get("dbfId"): card.get("id") for card in cards}
+    lines = []
+    for card in cards:
+        if not (card.get("isBattlegroundsPoolMinion") or card.get("isBattlegroundsPoolSpell")):
+            continue
+        if not CARD_ID.match(card.get("id", "")):
+            continue
+        lines.append(f"{card['id']},normal,bg")
+        golden = by_dbf.get(card.get("battlegroundsPremiumDbfId")) if with_golden else None
+        if golden and CARD_ID.match(golden):
+            lines.append(f"{golden},normal,bg")
+    return sorted(set(lines))

@@ -106,34 +106,70 @@ def colour_fit(art_low: np.ndarray, render: np.ndarray, mask: np.ndarray) -> tup
     return gain, bias
 
 
+def _gradients(gray: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
+    return cv2.Sobel(gray, cv2.CV_32F, 1, 0, ksize=3), cv2.Sobel(gray, cv2.CV_32F, 0, 1, ksize=3)
+
+
+def _structure_agrees(render_gray: np.ndarray, art_gray: np.ndarray, floor: float = 16.0, share: float = 0.5) -> np.ndarray:
+    """True where the two pictures have the same local drawing, not merely the same colour.
+
+    A frame part can match the art's colour by accident (dark rim next to a dark corner of the
+    art), but it brings edges the art does not have. The gradient difference is allowed to grow
+    with the edge strength, so real art edges survive small sharpness and alignment differences.
+    """
+    rx, ry = _gradients(render_gray)
+    ax, ay = _gradients(art_gray)
+    differ = cv2.GaussianBlur(np.hypot(rx - ax, ry - ay), (0, 0), 0.7)
+    strength = cv2.GaussianBlur(np.maximum(np.hypot(rx, ry), np.hypot(ax, ay)), (0, 0), 0.7)
+    return differ < floor + share * strength
+
+
+def _enclosed(mask: np.ndarray) -> np.ndarray:
+    """Pixels outside `mask` that cannot be reached from the picture border (holes in it)."""
+    height, width = mask.shape
+    padded = np.zeros((height + 2, width + 2), np.uint8)
+    padded[1:-1, 1:-1] = mask.astype(np.uint8)
+    cv2.floodFill(padded, None, (0, 0), 2)
+    return padded[1:-1, 1:-1] == 0
+
+
 def art_window(render_bgra: np.ndarray, art_bgr: np.ndarray, place: Placement, tolerance: float = 34,
                window=(0.3, 0.7)) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
     """Mask of render pixels that show the art, plus the art -> render colour transform.
 
-    Starts from the matched centre, fits colours there, then grows to every pixel whose colour
-    agrees with the art; frame parts, name banners and gems drawn over the art drop out.
+    Starts from the matched centre, fits colours there, then keeps the connected region around it
+    whose colour and drawing both agree with the art; frame parts, name banners and gems drawn
+    over the art drop out. Holes left by strong art edges are filled only where the colour agrees.
     Returns (mask bool HxW, gain[3], bias[3]).
     """
     height, width = render_bgra.shape[:2]
     matrix = place.matrix()
-    art_low = cv2.warpAffine(art_bgr, matrix, (width, height), flags=cv2.INTER_AREA).astype(np.float32)
+    art_low_u8 = cv2.warpAffine(art_bgr, matrix, (width, height), flags=cv2.INTER_AREA)
+    art_low = art_low_u8.astype(np.float32)
     inside = cv2.warpAffine(np.full(art_bgr.shape[:2], 255, np.uint8), matrix, (width, height)) > 250
     render = render_bgra[..., :3].astype(np.float32)
     opaque = render_bgra[..., 3] > 250
+    render_gray = cv2.cvtColor(np.ascontiguousarray(render_bgra[..., :3]), cv2.COLOR_BGR2GRAY).astype(np.float32)
     size = art_bgr.shape[0]
     c0, c1 = size * window[0], size * window[1]
-    mask = np.zeros((height, width), bool)
-    mask[max(int(place.oy + c0 * place.sy), 0):int(place.oy + c1 * place.sy),
+    seed = np.zeros((height, width), bool)
+    seed[max(int(place.oy + c0 * place.sy), 0):int(place.oy + c1 * place.sy),
          max(int(place.ox + c0 * place.sx), 0):int(place.ox + c1 * place.sx)] = True
+    mask = seed
     gain, bias = np.ones(3, np.float32), np.zeros(3, np.float32)
     for _ in range(3):
         gain, bias = colour_fit(art_low, render, mask)
-        diff = np.abs(art_low * gain + bias - render).max(axis=2)
-        grown = (inside & opaque & (diff < tolerance)).astype(np.uint8)
-        grown = cv2.morphologyEx(grown, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
-        grown = cv2.morphologyEx(grown, cv2.MORPH_CLOSE, np.ones((9, 9), np.uint8))
-        count, labels, stats, _ = cv2.connectedComponentsWithStats(grown, 8)
+        fitted = np.clip(art_low * gain + bias, 0, 255)
+        colour_ok = inside & opaque & (np.abs(fitted - render).max(axis=2) < tolerance)
+        fitted_gray = cv2.cvtColor(fitted.astype(np.uint8), cv2.COLOR_BGR2GRAY).astype(np.float32)
+        strict = (colour_ok & _structure_agrees(render_gray, fitted_gray)).astype(np.uint8)
+        strict = cv2.morphologyEx(strict, cv2.MORPH_OPEN, np.ones((3, 3), np.uint8))
+        count, labels, stats, _ = cv2.connectedComponentsWithStats(strict, 8)
         if count < 2:
             return np.zeros((height, width), bool), gain, bias
-        mask = labels == (1 + int(np.argmax(stats[1:, cv2.CC_STAT_AREA])))
+        overlap = [int((labels[seed] == label).sum()) for label in range(1, count)]
+        chosen = np.argmax(overlap) if max(overlap) else np.argmax(stats[1:, cv2.CC_STAT_AREA])
+        body = labels == (1 + int(chosen))
+        body = body | (_enclosed(body) & colour_ok)
+        mask = cv2.morphologyEx(body.astype(np.uint8), cv2.MORPH_CLOSE, np.ones((3, 3), np.uint8)).astype(bool) & colour_ok
     return mask, gain, bias

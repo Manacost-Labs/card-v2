@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "cardv2"
-version = "0.1.0"
+version = "0.2.0"
 description = "Build high-resolution Hearthstone card images from existing low-resolution renders"
 requires-python = ">=3.10"
 dependencies = [

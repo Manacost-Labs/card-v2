@@ -15,7 +15,7 @@ import cv2
 import numpy as np
 
 from .errors import CardError
-from .imaging import alpha_bbox, load_bgra
+from .imaging import alpha_bbox, load_bgra, save_png
 from .register import art_window, locate
 
 MIN_SCORE = 0.8
@@ -145,20 +145,57 @@ def transfer(frames: list[np.ndarray], art: np.ndarray, card_low: np.ndarray, ca
         yield cv2.resize(cropped, (out_width, out_height), interpolation=cv2.INTER_AREA)
 
 
-def encode(frames_dir: Path, fps: float, size: tuple[int, int], webm: Path | None, mp4: Path | None,
-           background: str = "18181c") -> None:
-    """Encode numbered PNG frames: VP9 WebM keeps transparency, H.264 MP4 is flattened on a colour."""
+def loop_blend(frames_dir: Path, blend: int) -> dict:
+    """Make the loop seamless by cross-fading the frames after the loop point into its start.
+
+    The last `blend` frames are removed; each of the first `blend` frames becomes a mix of itself
+    and the frame that used to follow the new loop point. Reports the size of the jump at the
+    loop point before and after, next to a typical step between neighbouring frames.
+    """
+    files = sorted(frames_dir.glob("f_*.png"))
+    count = len(files)
+
+    def step(a: Path, b: Path) -> float:
+        return float(np.abs(load_bgra(a)[..., :3].astype(np.float32) - load_bgra(b)[..., :3].astype(np.float32)).mean())
+
+    probes = [index for index in (count // 4, count // 2, 3 * count // 4) if 0 < index < count]
+    typical = float(np.median([step(files[index - 1], files[index]) for index in probes])) if probes else 0.0
+    report = {"blend_frames": 0, "jump_before": round(step(files[-1], files[0]), 3), "step_typical": round(typical, 3)}
+    blend = min(blend, count // 3)
+    if blend < 1:
+        return {**report, "jump_after": report["jump_before"], "frames": count}
+    kept = count - blend
+    for index in range(blend):
+        weight = (index + 1) / (blend + 1)
+        head = load_bgra(files[index]).astype(np.float32)
+        tail = load_bgra(files[kept + index]).astype(np.float32)
+        save_png(files[index], np.clip(head * weight + tail * (1 - weight) + 0.5, 0, 255).astype(np.uint8))
+    for path in files[kept:]:
+        path.unlink()
+    return {**report, "blend_frames": blend, "jump_after": round(step(files[kept - 1], files[0]), 3), "frames": kept}
+
+
+def encode(frames_dir: Path, fps: float, size: tuple[int, int], outputs: dict[str, Path], background: str = "18181c") -> None:
+    """Encode numbered PNG frames.
+
+    webm: VP9 with transparency, for <video>. webp: animated WebP with transparency, for <img>.
+    mp4: H.264 flattened on a colour, for players without alpha support.
+    """
     ffmpeg = require_ffmpeg()
     pattern = str(frames_dir / "f_%04d.png")
     rate = f"{fps:g}"
-    if webm:
-        webm.parent.mkdir(parents=True, exist_ok=True)
-        _run([ffmpeg, "-v", "error", "-y", "-framerate", rate, "-i", pattern, "-c:v", "libvpx-vp9",
-              "-pix_fmt", "yuva420p", "-b:v", "0", "-crf", "26", "-row-mt", "1", str(webm)])
-    if mp4:
-        mp4.parent.mkdir(parents=True, exist_ok=True)
+    source = ["-framerate", rate, "-i", pattern]
+    for path in outputs.values():
+        path.parent.mkdir(parents=True, exist_ok=True)
+    if "webm" in outputs:
+        _run([ffmpeg, "-v", "error", "-y", *source, "-c:v", "libvpx-vp9", "-pix_fmt", "yuva420p",
+              "-b:v", "0", "-crf", "26", "-row-mt", "1", str(outputs["webm"])])
+    if "webp" in outputs:
+        _run([ffmpeg, "-v", "error", "-y", *source, "-c:v", "libwebp_anim", "-pix_fmt", "yuva420p",
+              "-loop", "0", "-q:v", "78", "-compression_level", "4", str(outputs["webp"])])
+    if "mp4" in outputs:
         width, height = size[0] // 2 * 2, size[1] // 2 * 2  # H.264 needs even dimensions
         flatten = f"[1:v]crop={width}:{height}:0:0[card];[0:v][card]overlay=shortest=1,format=yuv420p"
         _run([ffmpeg, "-v", "error", "-y", "-f", "lavfi", "-i", f"color=c=0x{background}:s={width}x{height}:r={rate}",
-              "-framerate", rate, "-i", pattern, "-filter_complex", flatten,
-              "-c:v", "libx264", "-crf", "17", "-preset", "slow", "-movflags", "+faststart", str(mp4)])
+              *source, "-filter_complex", flatten,
+              "-c:v", "libx264", "-crf", "17", "-preset", "slow", "-movflags", "+faststart", str(outputs["mp4"])])

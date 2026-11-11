@@ -1,13 +1,14 @@
 import json
+import shutil
 
 import cv2
 import numpy as np
 import pytest
 
 from cardv2 import cli, sources
-from cardv2.animate import transfer
+from cardv2.animate import decode_frames, encode, loop_blend, transfer
 from cardv2.errors import CardError
-from cardv2.imaging import load_bgra, save_png
+from cardv2.imaging import compare_sheet, fidelity, load_bgra, save_image, save_png
 from cardv2.onboard import ONBOARD_PLACEMENT, compose_onboard
 from cardv2.pipeline import Builder
 from cardv2.register import art_window, locate
@@ -212,11 +213,145 @@ def test_cli_hand_and_batch(tmp_path, render, art, fake_upscaler, monkeypatch, c
     (tmp_path / "batch" / "TEST_001.png").write_bytes(b"x")
     assert cli.main(["batch", "--ids-file", str(ids), "--out-dir", str(tmp_path / "batch")]) == 1
     lines = [json.loads(line) for line in capsys.readouterr().out.strip().splitlines()]
-    assert [line["ok"] for line in lines] == [True, False]
+    assert [line["ok"] for line in lines] == [True, False, False]
     assert lines[0]["skipped"] == "exists" and lines[1]["error"]["code"] == "bad_card_id"
+    assert lines[2] == {"ok": False, "command": "batch", "built": 0, "skipped": 1, "failed": 1, "warned": 0}
 
 
 def test_cli_rejects_unknown_variant():
     with pytest.raises(SystemExit) as caught:
         cli.main(["hand", "RLK_706", "--out", "o.png", "--variant", "platinum"])
     assert caught.value.code == 2
+
+
+# ---------- art window must not leak onto the frame ----------
+def test_art_window_stops_at_a_rim_even_when_the_frame_has_the_art_colour(render, art):
+    """A frame part with the art's own colours right next to the window must stay frame."""
+    place = locate(render[..., :3], art)
+    matrix = np.float32([[PLACE["scale"], 0, PLACE["ox"]], [0, PLACE["scale"], PLACE["oy"]]])
+    placed = cv2.warpAffine(art, matrix, (render.shape[1], render.shape[0]), flags=cv2.INTER_AREA)
+    leaky = render.copy()
+    leaky[60:230, 25:62, :3] = placed[60:230, 25:62]                       # same colours as the art, outside the oval
+    cv2.ellipse(leaky, (155, 145), (95, 105), 0, 0, 360, (20, 20, 20, 255), 3)  # the rim between them
+    cv2.line(leaky, (35, 90), (50, 150), (240, 200, 60, 255), 3)            # a glyph drawn on the frame
+    mask, _, _ = art_window(leaky, art, place)
+    outside = np.zeros(mask.shape, np.uint8)
+    cv2.ellipse(outside, (155, 145), (99, 109), 0, 0, 360, 1, -1)
+    assert mask[120, 155] and mask[(outside == 0)].mean() < 0.002
+    assert not mask[60:230, 25:55].any()
+
+
+# ---------- fidelity ----------
+def test_fidelity_ignores_sharpening_but_sees_changed_content(render):
+    up = cv2.resize(render, None, fx=4, fy=4, interpolation=cv2.INTER_CUBIC)
+    sharp = cv2.addWeighted(up, 1.6, cv2.GaussianBlur(up, (0, 0), 3), -0.6, 0)
+    clean = fidelity(render, sharp)
+    assert clean["mean_diff"] < 3 and clean["region_diff"] < 12
+    damaged = up.copy()
+    damaged[1200:1400, 400:700, :3] = (30, 200, 240)      # something painted over the card body
+    assert fidelity(render, damaged)["region_diff"] > 60
+    shifted = np.roll(up, 8, axis=1)                        # every layer 2 source pixels to the right
+    assert fidelity(render, shifted)["mean_diff"] > 2 * clean["mean_diff"]
+
+
+def test_hand_reports_a_fidelity_warning_without_failing(tmp_path, render, art, fake_upscaler):
+    render_path, art_path = _files(tmp_path, render, art)
+    builder = Builder(upscaler=fake_upscaler)
+    fine = builder.hand("TEST_001", str(tmp_path / "a.png"), render=render_path, art=art_path)
+    assert fine["fidelity"]["faithful"] and fine["warnings"] == []
+    strict = builder.hand("TEST_001", str(tmp_path / "b.png"), render=render_path, art=art_path, max_region_diff=0.01)
+    assert strict["ok"] and strict["warnings"] == ["fidelity"] and strict["fidelity"]["faithful"] is False
+
+
+# ---------- output formats and comparison sheets ----------
+def test_webp_output_and_unknown_extension(tmp_path, render):
+    save_image(tmp_path / "card.webp", render, 80)
+    data = (tmp_path / "card.webp").read_bytes()
+    assert data[:4] == b"RIFF" and data[8:12] == b"WEBP"
+    assert load_bgra(tmp_path / "card.webp").shape == render.shape
+    with pytest.raises(CardError) as caught:
+        save_image(tmp_path / "card.gif", render)
+    assert caught.value.code == "bad_format"
+
+
+def test_compare_sheet_layout(render):
+    after = cv2.resize(render[15:426, 20:301], (562, 822), interpolation=cv2.INTER_CUBIC)
+    sheet = compare_sheet(render, after)
+    assert sheet.shape == (822, 562 * 2 + 24, 4)
+    # the source is trimmed to its card and stretched: both halves show the same picture
+    assert np.abs(sheet[400, 281, :3].astype(int) - sheet[400, 562 + 24 + 281, :3].astype(int)).max() < 30
+    zoomed = compare_sheet(render, after, zoom=(0.25, 0.1, 0.75, 0.5))
+    assert zoomed.shape[1] == sheet.shape[1] and zoomed.shape[0] == 822 + 24 + round(562 * (0.4 * 822) / (0.5 * 562))
+    with pytest.raises(CardError):
+        compare_sheet(render, after, zoom=(0.5, 0.1, 0.4, 0.5))
+
+
+def test_cli_compare(tmp_path, render, capsys):
+    before, after = tmp_path / "before.png", tmp_path / "after.png"
+    save_png(before, render)
+    save_png(after, cv2.resize(render[15:426, 20:301], (562, 822), interpolation=cv2.INTER_CUBIC))
+    out = tmp_path / "sheet.webp"
+    base = ["compare", "--before", str(before), "--after", str(after), "--out", str(out)]
+    assert cli.main([*base, "--zoom", "0.2,0.5,0.8,0.9"]) == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["ok"] and payload["enlargement"] == round(562 / 320, 2) and out.exists()
+    assert cli.main([*base, "--zoom", "1,2"]) == 1
+    assert json.loads(capsys.readouterr().out)["error"]["code"] == "bad_zoom"
+
+
+# ---------- animation: loop and encoding ----------
+def _write_ramp(directory, count, size=(64, 96)):
+    directory.mkdir(parents=True, exist_ok=True)
+    for index in range(count):
+        frame = np.full((size[1], size[0], 4), 255, np.uint8)
+        frame[..., :3] = index * 10
+        save_png(directory / f"f_{index + 1:04d}.png", frame)
+
+
+def test_loop_blend_removes_the_jump(tmp_path):
+    _write_ramp(tmp_path / "frames", 12)
+    report = loop_blend(tmp_path / "frames", 4)
+    assert report["frames"] == 8 == len(list((tmp_path / "frames").glob("f_*.png")))
+    assert report["jump_before"] == 110 and report["jump_after"] < 10 and report["blend_frames"] == 4
+    assert load_bgra(tmp_path / "frames" / "f_0001.png")[0, 0, 0] == 64   # 0.2 * frame 1 + 0.8 * frame 9
+
+    _write_ramp(tmp_path / "plain", 12)
+    untouched = loop_blend(tmp_path / "plain", 0)
+    assert untouched["frames"] == 12 and untouched["jump_after"] == untouched["jump_before"] == 110
+
+
+@pytest.mark.skipif(shutil.which("ffmpeg") is None, reason="ffmpeg not installed")
+def test_encode_all_formats_and_decode_back(tmp_path):
+    _write_ramp(tmp_path / "frames", 6)
+    outputs = {name: tmp_path / f"clip.{name}" for name in ("webm", "webp", "mp4")}
+    encode(tmp_path / "frames", 20, (64, 96), outputs)
+    assert all(path.stat().st_size > 0 for path in outputs.values())
+    assert outputs["webp"].read_bytes()[8:12] == b"WEBP"
+    frames, fps = decode_frames(outputs["webm"], tmp_path / "decoded")
+    assert len(frames) == 6 and fps == 20 and frames[0].shape == (96, 64, 4)
+
+
+# ---------- catalogue ----------
+def test_card_ids_from_catalogue(tmp_path, monkeypatch):
+    catalogue = tmp_path / "cards.json"
+    catalogue.write_text(json.dumps([
+        {"id": "EX1_298", "dbfId": 1, "collectible": True},
+        {"id": "BG_1", "dbfId": 2, "isBattlegroundsPoolMinion": True, "battlegroundsPremiumDbfId": 3},
+        {"id": "BG_1_G", "dbfId": 3},
+        {"id": "BG_S", "dbfId": 4, "isBattlegroundsPoolSpell": True},
+        {"id": "bad id", "dbfId": 5, "isBattlegroundsPoolMinion": True},
+    ]), encoding="utf-8")
+    monkeypatch.setattr(sources, "fetch", lambda url, **kwargs: catalogue)
+    assert sources.card_ids("bg") == ["BG_1,normal,bg", "BG_S,normal,bg"]
+    assert sources.card_ids("bg", with_golden=True) == ["BG_1,normal,bg", "BG_1_G,normal,bg", "BG_S,normal,bg"]
+    assert sources.card_ids("collectible") == ["BG_1", "BG_1_G", "BG_S", "EX1_298"]
+    with pytest.raises(CardError):
+        sources.card_ids("everything")
+
+
+def test_cli_ids_writes_a_batch_file(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(sources, "card_ids", lambda kind, with_golden=False, refresh=False: ["A_1", "B_2"])
+    out = tmp_path / "ids.txt"
+    assert cli.main(["ids", "--out", str(out)]) == 0
+    assert out.read_text(encoding="utf-8") == "A_1\nB_2\n"
+    assert json.loads(capsys.readouterr().out)["count"] == 2
